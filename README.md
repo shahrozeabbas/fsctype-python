@@ -41,6 +41,7 @@ adata = sc.read_h5ad('your_data.h5ad')
 sc.pp.normalize_total(adata, target_sum=1e4)
 sc.pp.log1p(adata)
 sc.pp.scale(adata, max_value=10)
+sc.tl.pca(adata)
 sc.pp.neighbors(adata, n_neighbors=20)
 
 # Define cell type markers
@@ -66,8 +67,8 @@ config = fsc.FSCTypeConfig(
     confidence_threshold=0.5
 )
 
-predictor = fsc.FSCType(adata, config)
-predictions = predictor.predict(markers)
+model = fsc.FSCType(adata, config)
+predictions = model.predict(markers)
 
 # Results are stored in adata.obs
 print(adata.obs[['fsctype_prediction', 'fsctype_confidence']].head())
