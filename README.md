@@ -94,8 +94,8 @@ config = fsc.FSCTypeConfig(
 Main prediction class:
 
 ```python
-predictor = fsc.FSCType(adata, config)
-predictions = predictor.predict(markers, store_scores=True)
+model = fsc.FSCType(adata, config)
+predictions = model.predict(markers, store_scores=True)
 ```
 
 ## Marker Format
