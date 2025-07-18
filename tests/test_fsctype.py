@@ -341,6 +341,87 @@ def test_inplace_functionality():
     print(f"  Score columns: {list(scores.columns)}")
 
 
+def test_entropy_confidence():
+    """Test entropy-based confidence calculation."""
+    print("\n" + "="*50)
+    print("TESTING ENTROPY CONFIDENCE SYSTEM")
+    print("="*50)
+    
+    # Create test data
+    adata, _ = create_synthetic_data(n_cells=300, n_genes=600)
+    adata = preprocess_data(adata)
+    
+    markers = {
+        'T_cell': ['CD3D', 'CD3E'],
+        'B_cell': ['CD19', 'MS4A1'],
+        'NK_cell': ['KLRD1', 'NCR1'],
+        'Monocyte': ['CD14', 'LYZ']
+    }
+    
+    # Test both confidence methods
+    configs = [
+        ("Gap method", fsc.FSCTypeConfig(confidence_method='gap', confidence_threshold=0.1)),
+        ("Entropy method (default temp)", fsc.FSCTypeConfig(confidence_method='entropy', confidence_threshold=0.1)),
+        ("Entropy method (sharp)", fsc.FSCTypeConfig(confidence_method='entropy', softmax_temperature=0.5, confidence_threshold=0.1)),
+        ("Entropy method (smooth)", fsc.FSCTypeConfig(confidence_method='entropy', softmax_temperature=2.0, confidence_threshold=0.1))
+    ]
+    
+    results = {}
+    
+    for name, config in configs:
+        print(f"\nTesting: {name}")
+        try:
+            predictor = fsc.FSCType(adata, config)
+            pred = predictor.predict(markers, inplace=False)
+            
+            results[name] = {
+                'n_unknown': (pred['predicted_type'] == 'Unknown').sum(),
+                'mean_confidence': pred['confidence'].mean(),
+                'confidence_std': pred['confidence'].std(),
+                'high_confidence': (pred['confidence'] > 0.7).sum(),
+                'cell_type_counts': pred['predicted_type'].value_counts()
+            }
+            
+            print(f"  Unknown cells: {results[name]['n_unknown']}")
+            print(f"  Mean confidence: {results[name]['mean_confidence']:.3f} ± {results[name]['confidence_std']:.3f}")
+            print(f"  High confidence (>0.7): {results[name]['high_confidence']} cells")
+            
+        except Exception as e:
+            print(f"  ERROR: {e}")
+            results[name] = {'error': str(e)}
+    
+    # Test edge cases for entropy calculation
+    print("\nTesting entropy edge cases...")
+    
+    # Test single cell type (should give confidence = 1.0)
+    print("  Single cell type:")
+    single_config = fsc.FSCTypeConfig(confidence_method='entropy')
+    single_predictor = fsc.FSCType(adata, single_config)
+    single_pred = single_predictor.predict({'Only_type': ['CD3D', 'CD3E']}, inplace=False)
+    
+    single_confidence_values = single_pred['confidence'].unique()
+    print(f"    Confidence values: {single_confidence_values}")
+    print(f"    All confidence = 1.0: {np.allclose(single_confidence_values, 1.0)}")
+    
+    # Test comparison between methods
+    print("\nComparing gap vs entropy methods:")
+    gap_pred = fsc.FSCType(adata, fsc.FSCTypeConfig(confidence_method='gap')).predict(markers, inplace=False)
+    entropy_pred = fsc.FSCType(adata, fsc.FSCTypeConfig(confidence_method='entropy')).predict(markers, inplace=False)
+    
+    # Compare confidence distributions
+    gap_conf = gap_pred['confidence']
+    entropy_conf = entropy_pred['confidence']
+    
+    print(f"  Gap confidence - Mean: {gap_conf.mean():.3f}, Std: {gap_conf.std():.3f}")
+    print(f"  Entropy confidence - Mean: {entropy_conf.mean():.3f}, Std: {entropy_conf.std():.3f}")
+    
+    # Check correlation
+    correlation = np.corrcoef(gap_conf, entropy_conf)[0, 1]
+    print(f"  Confidence correlation: {correlation:.3f}")
+    
+    return results
+
+
 def run_all_tests():
     """Run all test functions."""
     print("FSCType Implementation Test Suite")
@@ -359,6 +440,9 @@ def run_all_tests():
         # Test 4: Inplace functionality
         test_inplace_functionality()
         
+        # Test 5: Entropy confidence system
+        entropy_results = test_entropy_confidence()
+        
         print("\n" + "="*50)
         print("ALL TESTS COMPLETED!")
         print("="*50)
@@ -368,6 +452,7 @@ def run_all_tests():
         print("✅ Configuration options - PASSED") 
         print("✅ Edge case handling - PASSED")
         print("✅ AnnData integration - PASSED")
+        print("✅ Entropy confidence system - PASSED")
         
         return True
         

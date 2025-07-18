@@ -64,11 +64,11 @@ markers = {
     'NK_cell': ['KLRD1', 'NCR1']
 }
 
-# Run FSCType
-config = fsc.FSCTypeConfig(n_neighbors=15, confidence_threshold=0.1)
+# Run FSCType with entropy confidence (default)
+config = fsc.FSCTypeConfig(n_neighbors=15, confidence_threshold=0.1, confidence_method='entropy')
 predictor = fsc.FSCType(adata, config)
 
-print("Running FSCType prediction...")
+print("Running FSCType prediction (entropy confidence)...")
 predictions = predictor.predict(markers, inplace=False)
 
 # Show results
@@ -93,6 +93,15 @@ if mask.sum() > 0:
     print(f"Accuracy (excluding Unknown): {accuracy:.3f}")
 else:
     print("All predictions are Unknown")
+
+# Compare with gap-based confidence
+print(f"\n=== COMPARING CONFIDENCE METHODS ===")
+gap_config = fsc.FSCTypeConfig(n_neighbors=15, confidence_threshold=0.1, confidence_method='gap')
+gap_predictor = fsc.FSCType(adata, gap_config)
+gap_predictions = gap_predictor.predict(markers, inplace=False)
+
+print(f"Entropy confidence - Mean: {predictions['confidence'].mean():.3f}")
+print(f"Gap confidence - Mean: {gap_predictions['confidence'].mean():.3f}")
 
 print(f"\nSuccess! FSCType appears to be working correctly.")
 print(f"Next: Try with your own data and markers!") 

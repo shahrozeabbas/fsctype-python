@@ -18,13 +18,18 @@ Examples
 >>> sc.pp.scale(adata, max_value=10)
 >>> sc.pp.neighbors(adata, n_neighbors=20)
 >>> 
->>> # FSCType handles annotation
+# FSCType handles annotation
 >>> markers = {
 >>>     'T_cell': {'positive': ['CD3D', 'CD3E'], 'negative': ['CD19']},
 >>>     'B_cell': {'positive': ['CD19', 'MS4A1'], 'negative': ['CD3D']}
 >>> }
 >>> 
->>> config = fsc.FSCTypeConfig(n_neighbors=20, weight_by_distance=True)
+>>> # Configure with entropy-based confidence (default)
+>>> config = fsc.FSCTypeConfig(
+>>>     n_neighbors=20, 
+>>>     confidence_method='entropy',
+>>>     softmax_temperature=1.0
+>>> )
 >>> predictor = fsc.FSCType(adata, config)
 >>> predictions = predictor.predict(markers)
 """

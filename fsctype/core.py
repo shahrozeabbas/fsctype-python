@@ -557,7 +557,7 @@ class FSCType:
         Convert aggregated scores to final predictions with confidence scores.
         
         For each cell, finds the highest-scoring cell type and calculates a confidence
-        score based on the gap between the top two predictions.
+        score using either gap-based or entropy-based method.
         
         Parameters
         ----------
@@ -570,10 +570,10 @@ class FSCType:
             DataFrame with columns: ['cell_id', 'predicted_type', 'score', 'confidence']
         """
         predictions = []
-        n_cell_types = len(aggregated_scores.columns)
         
         for cell_id in aggregated_scores.index:
             cell_scores = aggregated_scores.loc[cell_id]
+            scores_array = cell_scores.values
             
             # Sort scores in descending order
             sorted_scores = cell_scores.sort_values(ascending=False)
@@ -582,18 +582,11 @@ class FSCType:
             best_cell_type = sorted_scores.index[0]
             best_score = sorted_scores.iloc[0]
             
-            # Calculate confidence score
-            if n_cell_types == 1:
-                # Only one cell type - confidence is 1.0
-                confidence = 1.0
-            elif best_score <= 0:
-                # No positive evidence - confidence is 0.0
-                confidence = 0.0
-            else:
-                # Standard confidence: (max - second_max) / max
-                second_best_score = sorted_scores.iloc[1] if len(sorted_scores) > 1 else 0.0
-                confidence = (best_score - second_best_score) / best_score
-                confidence = max(0.0, min(1.0, confidence))  # Clamp to [0, 1]
+            # Calculate confidence score using selected method
+            if self.config.confidence_method == "gap":
+                confidence = self._calculate_gap_confidence(scores_array)
+            else:  # entropy
+                confidence = self._calculate_entropy_confidence(scores_array)
             
             # Check confidence threshold
             if confidence < self.config.confidence_threshold:
@@ -621,6 +614,144 @@ class FSCType:
         predictions_df = predictions_df.set_index('cell_id')
         
         return predictions_df
+    
+    def _stable_softmax(self, scores: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+        """
+        Numerically stable softmax implementation.
+        
+        Parameters
+        ----------
+        scores : np.ndarray
+            Input scores for cell types.
+        temperature : float, default=1.0
+            Temperature parameter controlling distribution sharpness.
+            
+        Returns
+        -------
+        probs : np.ndarray
+            Normalized probabilities that sum to 1.0.
+        """
+        # Shift by max to prevent overflow
+        shifted = (scores - np.max(scores)) / temperature
+        
+        # Clip to prevent extreme values
+        shifted = np.clip(shifted, -500, 500)
+        
+        # Calculate exponentials
+        exp_scores = np.exp(shifted)
+        
+        # Normalize to probabilities
+        return exp_scores / np.sum(exp_scores)
+    
+    def _safe_entropy(self, probs: np.ndarray, epsilon: float = 1e-10) -> float:
+        """
+        Calculate Shannon entropy with numerical protection.
+        
+        Parameters
+        ----------
+        probs : np.ndarray
+            Probability distribution.
+        epsilon : float, default=1e-10
+            Small value to prevent log(0).
+            
+        Returns
+        -------
+        entropy : float
+            Shannon entropy value.
+        """
+        # Ensure probabilities sum to 1
+        probs = probs / np.sum(probs)
+        
+        # Clip to prevent log(0)
+        safe_probs = np.clip(probs, epsilon, 1.0 - epsilon)
+        
+        # Calculate entropy
+        return -np.sum(probs * np.log(safe_probs))
+    
+    def _calculate_entropy_confidence(self, scores: np.ndarray) -> float:
+        """
+        Calculate confidence using entropy with robust edge case handling.
+        
+        Returns confidence in [0, 1] where:
+        - 1.0 = Perfect confidence (low entropy)
+        - 0.0 = No confidence (high entropy)
+        
+        Parameters
+        ----------
+        scores : np.ndarray
+            Cell type scores for a single cell.
+            
+        Returns
+        -------
+        confidence : float
+            Confidence score in [0, 1] range.
+        """
+        n_cell_types = len(scores)
+        
+        # Edge case 1: Single cell type
+        if n_cell_types == 1:
+            return 1.0
+        
+        # Edge case 2: All scores identical (within tolerance)
+        if np.allclose(scores, scores[0], rtol=1e-9):
+            return 0.0  # Maximum uncertainty
+        
+        # Edge case 3: Check for valid scores
+        if not np.isfinite(scores).all():
+            warnings.warn("Non-finite scores detected, using uniform confidence")
+            return 0.0
+        
+        # Main calculation with stable softmax
+        try:
+            probs = self._stable_softmax(scores, self.config.softmax_temperature)
+            entropy = self._safe_entropy(probs, self.config.entropy_epsilon)
+            
+            # Normalize to [0, 1] range
+            max_entropy = np.log(n_cell_types)
+            confidence = 1.0 - (entropy / max_entropy)
+            
+            # Ensure valid range
+            return np.clip(confidence, 0.0, 1.0)
+            
+        except Exception as e:
+            warnings.warn(f"Entropy calculation failed: {e}, falling back to gap method")
+            return self._calculate_gap_confidence(scores)
+    
+    def _calculate_gap_confidence(self, scores: np.ndarray) -> float:
+        """
+        Calculate confidence using gap between top two scores (original method).
+        
+        Parameters
+        ----------
+        scores : np.ndarray
+            Cell type scores for a single cell.
+            
+        Returns
+        -------
+        confidence : float
+            Confidence score in [0, 1] range.
+        """
+        n_cell_types = len(scores)
+        
+        # Sort scores in descending order
+        sorted_scores = np.sort(scores)[::-1]
+        
+        best_score = sorted_scores[0]
+        
+        # Calculate confidence score
+        if n_cell_types == 1:
+            # Only one cell type - confidence is 1.0
+            confidence = 1.0
+        elif best_score <= 0:
+            # No positive evidence - confidence is 0.0
+            confidence = 0.0
+        else:
+            # Standard confidence: (max - second_max) / max
+            second_best_score = sorted_scores[1] if len(sorted_scores) > 1 else 0.0
+            confidence = (best_score - second_best_score) / best_score
+            confidence = max(0.0, min(1.0, confidence))  # Clamp to [0, 1]
+        
+        return confidence
     
     def predict(self, 
                 markers: Dict[str, Union[List[str], Dict[str, List[str]]]], 
