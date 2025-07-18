@@ -95,7 +95,15 @@ Main prediction class:
 
 ```python
 model = fsc.FSCType(adata, config)
-predictions = model.predict(markers, store_scores=True)
+
+# Basic prediction (returns predictions DataFrame)
+predictions = model.predict(markers, inplace=False)
+
+# Get both predictions and detailed cell type scores
+predictions, scores = model.predict(markers, inplace=False, return_scores=True)
+
+# Store results directly in adata.obs (default behavior)
+model.predict(markers, inplace=True)  # Adds to adata.obs['fsctype_prediction']
 ```
 
 ## Marker Format
