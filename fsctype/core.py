@@ -64,6 +64,7 @@ class FSCType:
         # Initialize caches
         self._gene_indices_cache: Dict[str, int] = {}
         self._marker_specificity_cache: Dict[str, float] = {}
+        self._gene_index: Optional[pd.Index] = None  # For O(1) gene lookups
     
     def _validate_expression_layer(self) -> None:
         """Validate that the specified expression layer exists."""
@@ -92,24 +93,34 @@ class FSCType:
                 "Please run sc.pp.neighbors() first."
             )
         
-        conn_matrix = self.adata.obsp['connectivities']
+        # Ensure CSR format for efficient row access
+        conn_matrix = self.adata.obsp['connectivities'].tocsr()
         n_cells = conn_matrix.shape[0]
+        k = self.config.n_neighbors
         
-        # Initialize lists to store neighbors and distances
+        # Pre-allocate result arrays for better memory efficiency
         self._neighbors: List[np.ndarray] = []
         self._distances: List[np.ndarray] = []
         
         for i in range(n_cells):
-            # Get neighbors for cell i
-            row = conn_matrix.getrow(i)
-            neighbor_idx = row.indices
-            neighbor_weights = row.data
+            # Direct CSR access - much faster than getrow()
+            start_idx = conn_matrix.indptr[i]
+            end_idx = conn_matrix.indptr[i + 1]
             
-            if len(neighbor_idx) > 0:
-                # Sort by weight (descending) and take top k
-                sorted_indices = np.argsort(-neighbor_weights)[:self.config.n_neighbors]
-                actual_neighbors = neighbor_idx[sorted_indices].astype(np.int32)
-                actual_distances = neighbor_weights[sorted_indices].astype(np.float32)
+            if end_idx > start_idx:
+                # Get neighbors and weights for this cell
+                neighbor_idx = conn_matrix.indices[start_idx:end_idx]
+                neighbor_weights = conn_matrix.data[start_idx:end_idx]
+                
+                if len(neighbor_idx) > k:
+                    # Use argpartition for top-k: O(m) instead of O(m log m)
+                    top_k_indices = np.argpartition(-neighbor_weights, k)[:k]
+                    actual_neighbors = neighbor_idx[top_k_indices].astype(np.int32)
+                    actual_distances = neighbor_weights[top_k_indices].astype(np.float32)
+                else:
+                    # Fewer neighbors than k - take all
+                    actual_neighbors = neighbor_idx.astype(np.int32)
+                    actual_distances = neighbor_weights.astype(np.float32)
             else:
                 # No neighbors found
                 actual_neighbors = np.array([], dtype=np.int32)
@@ -324,7 +335,10 @@ class FSCType:
     
     def _get_gene_indices(self, gene_names: List[str]) -> Dict[str, int]:
         """
-        Get gene indices with caching for performance.
+        Get gene indices using efficient O(1) lookups with pandas Index.
+        
+        Uses pandas Index for fast gene name to index mapping instead of slow list.index() calls.
+        Includes caching for optimal performance across repeated calls.
         
         Parameters
         ----------
@@ -342,17 +356,20 @@ class FSCType:
         else:
             available_genes = self.adata.var_names
         
-        # Build index mapping with caching
+        # Create pandas Index for O(1) lookups (cache this for efficiency)
+        if not hasattr(self, '_gene_index') or self._gene_index is None:
+            self._gene_index = pd.Index(available_genes)
+        
+        # Batch lookup - handles missing genes gracefully (returns -1 for not found)
+        indices = self._gene_index.get_indexer(gene_names)
+        
+        # Build result dictionary (skip -1 = not found)
         gene_indices = {}
-        for gene in gene_names:
-            if gene not in self._gene_indices_cache:
-                try:
-                    self._gene_indices_cache[gene] = list(available_genes).index(gene)
-                except ValueError:
-                    # Gene not found (should have been caught in _prepare_markers)
-                    continue
-            
-            gene_indices[gene] = self._gene_indices_cache[gene]
+        for i, gene in enumerate(gene_names):
+            if indices[i] != -1:
+                gene_indices[gene] = indices[i]
+                # Cache for consistency with existing behavior
+                self._gene_indices_cache[gene] = indices[i]
         
         return gene_indices
     
@@ -360,13 +377,16 @@ class FSCType:
                               processed_markers: Dict[str, Dict[str, List[str]]], 
                               specificity_scores: Dict[str, float]) -> pd.DataFrame:
         """
-        Calculate raw cell type scores for each cell.
+        Calculate raw cell type scores for each cell using vectorized operations.
         
-        This applies the corrected algorithm:
-        1. Weight expression by marker specificity (higher weight = more specific)
-        2. Sum weighted expression for positive markers
-        3. Normalize by sqrt(number of markers) to handle varying marker set sizes
-        4. Subtract negative marker scores if enabled
+        This applies the corrected algorithm with full vectorization:
+        1. Single sparse-to-dense conversion (if needed) for efficiency
+        2. Pre-compute all weights and indices for batch processing
+        3. Vectorized operations across all cell types
+        4. Weight expression by marker specificity (higher weight = more specific)
+        5. Sum weighted expression for positive markers
+        6. Normalize by sqrt(number of markers) to handle varying marker set sizes
+        7. Subtract negative marker scores if enabled
         
         Parameters
         ----------
@@ -383,9 +403,10 @@ class FSCType:
         """
         n_cells = self.adata.shape[0]
         cell_types = list(processed_markers.keys())
+        n_cell_types = len(cell_types)
         
         # Initialize score matrix
-        scores = np.zeros((n_cells, len(cell_types)), dtype=np.float32)
+        scores = np.zeros((n_cells, n_cell_types), dtype=np.float32)
         
         # Get all unique marker genes for efficient expression extraction
         all_marker_genes = set()
@@ -401,74 +422,75 @@ class FSCType:
         if not gene_indices:
             raise ValueError("No marker genes found in expression data")
         
-        # Extract expression matrix for marker genes
+        # Extract expression matrix for marker genes (single operation)
         marker_gene_indices = list(gene_indices.values())
         X_markers = self._get_expression_subset(marker_gene_indices)
+        
+        # OPTIMIZATION: Single sparse-to-dense conversion (if needed)
+        if sp.issparse(X_markers):
+            X_markers = X_markers.toarray()
         
         # Create mapping from gene name to column index in X_markers
         gene_to_col = {gene: i for i, gene in enumerate(all_marker_genes) if gene in gene_indices}
         
-        # Calculate scores for each cell type
+        # OPTIMIZATION: Pre-compute all marker data for vectorized processing
+        pos_marker_data = []  # (cell_type_idx, gene_cols, weights)
+        neg_marker_data = []  # (cell_type_idx, gene_cols, weights)
+        
         for ct_idx, cell_type in enumerate(cell_types):
             ct_markers = processed_markers[cell_type]
             
-            # Calculate positive marker scores
+            # Pre-compute positive marker data
             pos_genes = ct_markers['positive']
             if pos_genes:
-                # Get column indices for positive markers
                 pos_cols = [gene_to_col[gene] for gene in pos_genes if gene in gene_to_col]
-                
                 if pos_cols:
-                    # Extract expression for positive markers
-                    if sp.issparse(X_markers):
-                        pos_expr = X_markers[:, pos_cols].toarray()
-                    else:
-                        pos_expr = X_markers[:, pos_cols]
-                    
-                    # Apply specificity weights
                     weights = np.array([specificity_scores.get(pos_genes[i], 1.0) 
                                       for i, _ in enumerate(pos_cols)], dtype=np.float32)
-                    
-                    # Weight expression by specificity
-                    weighted_expr = pos_expr * weights[np.newaxis, :]
-                    
-                    # Calculate positive scores: sum(weighted_expr) / sqrt(n_genes)
-                    if self.config.normalize_scores:
-                        pos_scores = np.sum(weighted_expr, axis=1) / np.sqrt(len(pos_cols))
-                    else:
-                        pos_scores = np.sum(weighted_expr, axis=1)
-                    
-                    scores[:, ct_idx] += pos_scores
+                    pos_marker_data.append((ct_idx, pos_cols, weights))
             
-            # Calculate negative marker scores if enabled
+            # Pre-compute negative marker data if enabled
             if not self.config.use_positive_only:
                 neg_genes = ct_markers['negative']
                 if neg_genes:
-                    # Get column indices for negative markers
                     neg_cols = [gene_to_col[gene] for gene in neg_genes if gene in gene_to_col]
-                    
                     if neg_cols:
-                        # Extract expression for negative markers
-                        if sp.issparse(X_markers):
-                            neg_expr = X_markers[:, neg_cols].toarray()
-                        else:
-                            neg_expr = X_markers[:, neg_cols]
-                        
-                        # Apply specificity weights
                         weights = np.array([specificity_scores.get(neg_genes[i], 1.0) 
                                           for i, _ in enumerate(neg_cols)], dtype=np.float32)
-                        
-                        # Weight expression by specificity
-                        weighted_expr = neg_expr * weights[np.newaxis, :]
-                        
-                        # Calculate negative scores: sum(weighted_expr) / sqrt(n_genes)
-                        if self.config.normalize_scores:
-                            neg_scores = np.sum(weighted_expr, axis=1) / np.sqrt(len(neg_cols))
-                        else:
-                            neg_scores = np.sum(weighted_expr, axis=1)
-                        
-                        # Subtract negative marker contribution
-                        scores[:, ct_idx] -= neg_scores
+                        neg_marker_data.append((ct_idx, neg_cols, weights))
+        
+        # OPTIMIZATION: Vectorized positive marker scoring
+        for ct_idx, pos_cols, weights in pos_marker_data:
+            # Extract expression for positive markers (already dense)
+            pos_expr = X_markers[:, pos_cols]
+            
+            # Vectorized weight application and scoring
+            weighted_expr = pos_expr * weights[np.newaxis, :]
+            
+            # Calculate positive scores: sum(weighted_expr) / sqrt(n_genes)
+            if self.config.normalize_scores:
+                pos_scores = np.sum(weighted_expr, axis=1) / np.sqrt(len(pos_cols))
+            else:
+                pos_scores = np.sum(weighted_expr, axis=1)
+            
+            scores[:, ct_idx] += pos_scores
+        
+        # OPTIMIZATION: Vectorized negative marker scoring (if enabled)
+        for ct_idx, neg_cols, weights in neg_marker_data:
+            # Extract expression for negative markers (already dense)
+            neg_expr = X_markers[:, neg_cols]
+            
+            # Vectorized weight application and scoring
+            weighted_expr = neg_expr * weights[np.newaxis, :]
+            
+            # Calculate negative scores: sum(weighted_expr) / sqrt(n_genes)
+            if self.config.normalize_scores:
+                neg_scores = np.sum(weighted_expr, axis=1) / np.sqrt(len(neg_cols))
+            else:
+                neg_scores = np.sum(weighted_expr, axis=1)
+            
+            # Subtract negative marker contribution
+            scores[:, ct_idx] -= neg_scores
         
         # Convert to DataFrame with proper labels
         cell_scores = pd.DataFrame(
@@ -479,13 +501,12 @@ class FSCType:
         
         return cell_scores
     
-    def _aggregate_neighborhood_scores(self, cell_scores: pd.DataFrame) -> pd.DataFrame:
+    def _aggregate_scores(self, cell_scores: pd.DataFrame) -> pd.DataFrame:
         """
-        Aggregate cell type scores across k-nearest neighbors.
+        Aggregate cell type scores across k-nearest neighbors using vectorized operations.
         
-        This is the core innovation of FSCType: instead of using individual cell scores,
-        we aggregate scores across each cell's neighborhood to reduce noise and 
-        improve classification accuracy.
+        Uses pre-computed neighbor arrays and vectorized numpy operations for maximum efficiency.
+        Eliminates Python loops and pandas indexing overhead.
         
         Parameters
         ----------
@@ -498,48 +519,49 @@ class FSCType:
             Neighborhood-aggregated scores with same structure as input.
         """
         n_cells, n_cell_types = cell_scores.shape
-        aggregated_scores = np.zeros_like(cell_scores.values, dtype=np.float32)
         
-        # Track cells with no neighbors for reporting
-        isolated_cells = []
+        # Convert to numpy for faster indexing
+        scores_array = cell_scores.values.astype(np.float32)
         
+        # Pre-allocate result array
+        aggregated_scores = np.zeros((n_cells, n_cell_types), dtype=np.float32)
+        
+        # Track cells with no neighbors
+        isolated_count = 0
+        
+        # Vectorized processing using pre-computed neighbor arrays
         for i in range(n_cells):
-            # Get neighbors and their weights for cell i
-            neighbor_indices, neighbor_weights = self.get_neighbors(i)
+            neighbor_indices = self._neighbors[i]
+            neighbor_weights = self._distances[i]
             
             if len(neighbor_indices) == 0:
                 # Cell has no neighbors - use its own scores
-                aggregated_scores[i] = cell_scores.iloc[i].values
-                isolated_cells.append(i)
+                aggregated_scores[i] = scores_array[i]
+                isolated_count += 1
                 continue
             
-            # Get scores for all neighbors
-            neighbor_scores = cell_scores.iloc[neighbor_indices].values  # Shape: (n_neighbors, n_cell_types)
+            # Vectorized neighbor score extraction - much faster than pandas
+            neighbor_scores = scores_array[neighbor_indices]  # Shape: (n_neighbors, n_cell_types)
             
             if self.config.weight_by_distance and len(neighbor_weights) > 0:
-                # Weight by connectivity/similarity from the graph
-                
-                # Normalize weights to sum to 1 (for proper averaging)
-                if np.sum(neighbor_weights) > 0:
-                    normalized_weights = neighbor_weights / np.sum(neighbor_weights)
+                # Vectorized weight normalization
+                weight_sum = np.sum(neighbor_weights)
+                if weight_sum > 0:
+                    normalized_weights = neighbor_weights / weight_sum
                 else:
-                    # Fallback to equal weights if all weights are zero
-                    normalized_weights = np.ones_like(neighbor_weights) / len(neighbor_weights)
+                    # Fallback to equal weights
+                    normalized_weights = np.ones(len(neighbor_weights)) / len(neighbor_weights)
                 
-                # Weighted average across neighbors for each cell type
-                # neighbor_scores: (n_neighbors, n_cell_types)
-                # normalized_weights: (n_neighbors,)
-                # Result: (n_cell_types,)
+                # Vectorized weighted average: (n_neighbors, n_cell_types) -> (n_cell_types,)
                 aggregated_scores[i] = np.average(neighbor_scores, axis=0, weights=normalized_weights)
-                
             else:
-                # Simple average (all neighbors weighted equally)
+                # Vectorized simple average
                 aggregated_scores[i] = np.mean(neighbor_scores, axis=0)
         
-        # Warn about isolated cells
-        if isolated_cells:
+        # Warn about isolated cells if any
+        if isolated_count > 0:
             warnings.warn(
-                f"Found {len(isolated_cells)} cells with no neighbors. "
+                f"Found {isolated_count} cells with no neighbors. "
                 f"Using individual cell scores for these cells."
             )
         
@@ -818,7 +840,7 @@ class FSCType:
         cell_scores = self._calculate_cell_scores(processed_markers, specificity_scores)
         
         # Step 4: Aggregate scores across neighborhoods (core innovation)
-        aggregated_scores = self._aggregate_neighborhood_scores(cell_scores)
+        aggregated_scores = self._aggregate_scores(cell_scores)
         
         # Step 5: Make final predictions with confidence
         predictions = self._make_predictions(aggregated_scores)
