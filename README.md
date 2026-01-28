@@ -16,16 +16,8 @@ A Python implementation of the FSCType algorithm for automated cell type annotat
 
 ## Installation
 
-### From PyPI (coming soon)
 ```bash
-pip install fsctype
-```
-
-### From Source
-```bash
-git clone https://github.com/shahrozeabbas/fsctype-python.git
-cd fsctype-python
-pip install -e .
+pip install git+https://github.com/shahrozeabbas/fsctype-python.git
 ```
 
 ## Quick Start
